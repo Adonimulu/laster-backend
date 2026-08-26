@@ -1,7 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
-deepface
-tf-keras
 cloudscraper
 beautifulsoup4
