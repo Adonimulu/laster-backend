@@ -16,37 +16,62 @@ scraper = cloudscraper.create_scraper(
     browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
 )
 
+def is_social_profile(url):
+    """Checks if a URL belongs to a known social media platform."""
+    if not url or not isinstance(url, str) or not url.startswith('http'):
+        return False
+    social_domains = [
+        "instagram.com", "facebook.com", "fb.com", "twitter.com", "x.com",
+        "linkedin.com", "tiktok.com", "pinterest.com", "youtube.com",
+        "snapchat.com", "reddit.com", "t.me", "telegram.me", "vk.com", "ok.ru"
+    ]
+    domain = urlparse(url).netloc.lower()
+    return any(social in domain for social in social_domains)
+
 def extract_yandex_links(html):
     links = []
-    soup = BeautifulSoup(html, 'html.parser')
+    # Aggressive URL extraction from text
+    urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+/(?:[-\w./?%&=]*)?', html)
+    links.extend(urls)
 
+    soup = BeautifulSoup(html, 'html.parser')
     # 1. Best matches (Sites where image is found)
     for a in soup.find_all('a', href=True):
-        href = a['href']
-        if href.startswith('http') and "yandex" not in href.lower():
-            # Filter out generic assets
-            if not any(x in href.lower() for x in ['.png', '.jpg', '.jpeg', '.svg', 'yastatic', 'captcha']):
-                links.append(href)
+        links.append(a['href'])
 
     # 2. Extract from JSON state if present
     match = re.search(r'data-state="({.*?})"', html)
     if match:
         try:
             data = json.loads(match.group(1).replace('&quot;', '"'))
-            urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+/(?:[-\w./?%&=]*)?', str(data))
-            links.extend([u for u in urls if "yandex" not in u.lower()])
+            json_urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+/(?:[-\w./?%&=]*)?', str(data))
+            links.extend(json_urls)
         except:
             pass
 
-    return list(dict.fromkeys(links)) # Unique links
-
-def extract_google_links(html):
-    # Google Lens results in HTML
-    links = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+/(?:[-\w./?%&=]*)?', html)
     filtered = []
     for l in links:
-        if "google" not in l.lower() and l.startswith('http'):
-            if not any(x in l.lower() for x in ['.png', '.jpg', '.jpeg', 'gstatic', 'doubleclick']):
+        l_lower = l.lower()
+        if l.startswith('http') and "yandex" not in l_lower:
+            # Filter out generic assets and noise
+            if not any(x in l_lower for x in ['.png', '.jpg', '.jpeg', '.svg', 'yastatic', 'captcha', 'pixel', 'favicon', 'ads']):
+                filtered.append(l)
+
+    return list(dict.fromkeys(filtered))
+
+def extract_google_links(html):
+    # Aggressive URL extraction
+    links = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+/(?:[-\w./?%&=]*)?', html)
+
+    soup = BeautifulSoup(html, 'html.parser')
+    for a in soup.find_all('a', href=True):
+        links.append(a['href'])
+
+    filtered = []
+    for l in links:
+        l_lower = l.lower()
+        if l.startswith('http') and "google" not in l_lower:
+            if not any(x in l_lower for x in ['.png', '.jpg', '.jpeg', 'gstatic', 'doubleclick', 'favicon', 'ads']):
                 filtered.append(l)
     return list(dict.fromkeys(filtered))
 
@@ -124,9 +149,9 @@ async def facecheck_web_search(img_data: bytes):
             "demo": False
         }
 
-        # Polling loop (max ~40-60 seconds)
+        # Reduced polling loop to 15 iterations (30s total) for client resilience
         print("FaceCheck: Starting polling...")
-        for i in range(30):
+        for i in range(15):
             try:
                 search_resp = await asyncio.to_thread(scraper.post, search_url, json=payload, headers=headers, timeout=20)
                 if search_resp.status_code != 200:
@@ -158,7 +183,7 @@ async def facecheck_web_search(img_data: bytes):
             # Wait 2 seconds before next poll
             await asyncio.sleep(2)
 
-        print("FaceCheck: Polling timed out after 30 iterations.")
+        print("FaceCheck: Polling timed out after 15 iterations.")
         return []
     except Exception as e:
         print(f"FaceCheck: Global Scraper Error: {e}")
@@ -193,18 +218,18 @@ async def search(file: UploadFile = File(...)):
             return_exceptions=True
         )
 
-        # Handle exceptions from gather
-        if isinstance(y_resp, Exception):
+        # Handle exceptions from gather - resilience: errors don't stop other engines
+        y_links = []
+        if not isinstance(y_resp, Exception) and y_resp.status_code == 200:
+            y_links = extract_yandex_links(y_resp.text)
+        elif isinstance(y_resp, Exception):
             print(f"Search: Yandex error: {y_resp}")
-            y_links = []
-        else:
-            y_links = extract_yandex_links(y_resp.text) if y_resp.status_code == 200 else []
 
-        if isinstance(g_resp, Exception):
+        g_links = []
+        if not isinstance(g_resp, Exception) and g_resp.status_code == 200:
+            g_links = extract_google_links(g_resp.text)
+        elif isinstance(g_resp, Exception):
             print(f"Search: Google Lens error: {g_resp}")
-            g_links = []
-        else:
-            g_links = extract_google_links(g_resp.text) if g_resp.status_code == 200 else []
 
         if isinstance(fc_results, Exception):
             print(f"Search: FaceCheck error: {fc_results}")
@@ -212,28 +237,58 @@ async def search(file: UploadFile = File(...)):
 
         print(f"Search: Engine counts -> Yandex: {len(y_links)}, Google: {len(g_links)}, FaceCheck: {len(fc_results)}")
 
-        # Consolidate results
-        matches = []
+        # Consolidate and Rank results
+        raw_results = []
 
-        # 1. Prioritize FaceCheck
+        # 1. Collect FaceCheck results
         for res in fc_results:
-            matches.append(res)
+            res["source"] = "facecheck"
+            raw_results.append(res)
 
-        # 2. Add Yandex and Google results
-        existing_urls = {m.get("url") for m in matches if m.get("url") and m.get("url") != "https://facecheck.id"}
-        all_web_links = y_links + [l for l in g_links if l not in y_links]
+        # 2. Collect web links
+        combined_web = list(dict.fromkeys(y_links + g_links))
+        for l in combined_web:
+            raw_results.append({
+                "platform": get_platform_name(l),
+                "url": l,
+                "source": "web"
+            })
 
-        for l in all_web_links:
-            if l not in existing_urls:
-                matches.append({
-                    "platform": get_platform_name(l),
-                    "url": l
-                })
+        # Helper to define sorting priority
+        def get_priority(item):
+            source = item.get("source", "web")
+            url = item.get("url", "")
+            is_social = is_social_profile(url)
 
-        print(f"Search: Returning {len(matches)} total matches.")
+            if source == "facecheck":
+                if is_social: return 0  # Biometric + Social (Highest)
+                return 1               # Biometric Generic
+            if is_social: return 2     # Web Social
+            return 3                   # Web Generic (Lowest)
+
+        # Filter duplicates and placeholders
+        seen_urls = set()
+        unique_results = []
+        for item in raw_results:
+            url = item.get("url")
+            if url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            unique_results.append(item)
+
+        # Sort based on priority
+        unique_results.sort(key=get_priority)
+
+        # Clean: Filter out "facecheck.id" placeholder if better links are found
+        has_real_links = any(m.get("url") and "facecheck.id" not in m.get("url").lower() for m in unique_results)
+        if has_real_links:
+            unique_results = [m for m in unique_results if "facecheck.id" not in m.get("url").lower()]
+
+        print(f"Search: Returning {len(unique_results)} total matches.")
         return {
             "status": "success",
-            "matches": matches[:100],
+            "matches": unique_results[:100],
             "engines": {
                 "yandex": y_resp.url if hasattr(y_resp, 'url') and y_resp.status_code == 200 else None,
                 "google": g_resp.url if hasattr(g_resp, 'url') and g_resp.status_code == 200 else None,
