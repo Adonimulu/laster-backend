@@ -5,7 +5,16 @@ import uvicorn
 import os
 
 app = FastAPI()
-
+# In your main.py (Python Backend)
+def perform_search(image_features):
+    # If using a search engine API (like Google/Bing/SerpApi)
+    # Add "site:instagram.com" to the query string to force IG results
+    query = f"{detected_name_or_features} site:instagram.com"
+    
+    # ... perform search ...
+    
+    # Ensure your response matches the format the Android app expects:
+    # { "status": "success", "matches": [{ "platform": "Instagram", "url": "..." }] }
 # Stealth scraper to bypass bot detection
 scraper = cloudscraper.create_scraper(
     browser={'browser': 'chrome','platform': 'windows','mobile': False}
